@@ -1,247 +1,239 @@
 # -*- coding: utf-8 -*-
 """
-Captura la ventana indicada, extrae el número de serie del input 'carrete'
-y guarda un JPG nombrado con ese serial.
-Compatibilidad: Windows.
+Captura una ventana en Windows, extrae el número de serie tras la etiqueta 'Carrete:'
+y guarda un JPG nombrado con ese serial. Prioriza accesibilidad; usa OCR como respaldo.
 
-Ejemplos:
-  python capture_window.py --title "Pedido.txt - Notepad" --outdir "C:/Users/garci/Desktop/capturar_pantalla/img"
-  python capture_window.py --title "Pedido.txt - Notepad" --outdir "C:/Users/garci/Desktop/capturar_pantalla/img"  --tess "C:/Program Files/Tesseract-OCR/tesseract.exe"
-  # Si conoces el serial y quieres forzarlo:
-  python capture_window.py --title "Pedido.txt - Notepad" --serial "K900302392"
+Dependencias:
+  pip install pyautogui pygetwindow pillow pywinauto pytesseract opencv-python
 
-Dependencias: pyautogui, pygetwindow, pillow, pywinauto, pytesseract, opencv-python
+Si Tesseract no está en PATH, ajusta DEFAULT_TESSERACT_PATH.
 """
 
 import argparse
-import os
 import re
 import sys
 import time
 from pathlib import Path
 
-# ---- Dependencias de captura/UI ----
+# ------------------ CONFIGURACIÓN PREDETERMINADA ------------------
+DEFAULT_WINDOW_TITLE = "Pedido.txt - Notepad"  # Cambia al título de tu aplicación
+DEFAULT_OUTPUT_DIR = r"C:/Users/garci/Desktop/capturar_pantalla/img"  # Carpeta destino
+DEFAULT_TESSERACT_PATH = r"C:/Program Files/Tesseract-OCR/tesseract.exe"  # tesseract.exe
+
+# ------------------ IMPORTS CON CONTROL DE ERRORES ------------------
 try:
     import pyautogui
     import pygetwindow as gw
-except Exception:
-    print("Error: faltan dependencias. Instala con: pip install pyautogui pygetwindow pillow")
+except Exception as e:
+    print("Faltan dependencias base (pyautogui, pygetwindow, pillow).")
+    print("Instala: pip install pyautogui pygetwindow pillow")
     sys.exit(1)
 
-# pywinauto para extraer el valor del input 'carrete' si la app expone accesibilidad UIA
 try:
     from pywinauto import Application
     from pywinauto.controls.uia_controls import EditWrapper
-    from pywinauto.findwindows import ElementNotFoundError
     PYWINAUTO_OK = True
 except Exception:
     PYWINAUTO_OK = False
 
-# OCR de respaldo
 try:
     import pytesseract
     import cv2
+    import numpy as np
     from PIL import Image
     OCR_OK = True
 except Exception:
     OCR_OK = False
 
-
+# ------------------ UTILIDADES BÁSICAS ------------------
 def ensure_windows():
     if sys.platform != "win32":
         raise OSError("Este script está diseñado para Windows.")
 
-
 def find_window(title_substr: str | None):
+    """Ventana activa si no se pasa título; si se pasa, busca exacto y luego por substring."""
     if title_substr is None:
         return gw.getActiveWindow()
-    all_windows = gw.getAllWindows()
-    exact = [w for w in all_windows if w.title.strip() == title_substr.strip()]
+    wins = gw.getAllWindows()
+    exact = [w for w in wins if w.title.strip() == title_substr.strip()]
     if exact:
         return exact[0]
-    title_lower = title_substr.lower()
-    partial = [w for w in all_windows if title_lower in w.title.lower()]
+    t = title_substr.lower()
+    partial = [w for w in wins if t in w.title.lower()]
     return partial[0] if partial else None
-
 
 def bring_to_front(win):
     try:
-        win.activate(); time.sleep(0.2)
+        win.activate(); time.sleep(0.25)
         if win.isMinimized:
-            win.restore(); time.sleep(0.2)
-        win.activate(); time.sleep(0.2)
+            win.restore(); time.sleep(0.25)
+        win.activate(); time.sleep(0.25)
     except Exception:
         pass
 
-
 def get_window_box(win):
     left, top, right, bottom = win.left, win.top, win.right, win.bottom
-    w = max(0, right - left)
-    h = max(0, bottom - top)
+    w = max(0, right - left); h = max(0, bottom - top)
     if w < 10 or h < 10:
-        raise ValueError("La ventana no es visible o tiene tamaño inválido.")
+        raise ValueError("La ventana no es visible o su tamaño es inválido.")
     return (left, top, w, h)
 
-
-def screenshot_region(region):
+def screenshot_region(region) -> "Image.Image":
     try:
-        img = pyautogui.screenshot(region=region)
-        return img
+        return pyautogui.screenshot(region=region)
     except Exception as e:
         raise RuntimeError(f"No se pudo capturar la pantalla: {e}") from e
 
-
-def save_jpg(pil_img: Image.Image, outfile: Path):
-    outfile.parent.mkdir(parents=True, exist_ok=True)
+def save_jpg(pil_img: "Image.Image", out_path: Path):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        pil_img.save(outfile, format="JPEG", quality=95, subsampling=0, optimize=True)
+        pil_img.save(out_path, format="JPEG", quality=95, subsampling=0, optimize=True)
     except PermissionError as e:
-        raise PermissionError(f"Permiso denegado al guardar en: {outfile}") from e
+        raise PermissionError(f"Permiso denegado al guardar en: {out_path}") from e
     except FileNotFoundError as e:
-        raise FileNotFoundError(f"Ruta no válida: {outfile}") from e
+        raise FileNotFoundError(f"Ruta no válida: {out_path}") from e
     except Exception as e:
         raise RuntimeError(f"No se pudo guardar la imagen: {e}") from e
 
-
-# ---------- Extracción de serial ----------
+# ------------------ EXTRACCIÓN DE SERIAL ------------------
+# Endurece el patrón: seriales que comienzan con 'K' y longitud mínima 9
 SERIAL_REGEXES = [
-    r"\b[Kk][A-Za-z0-9]{5,20}\b",     # Ej: K900302392
-    r"\b[A-Za-z][A-Za-z0-9-]{5,20}\b" # fallback más laxo
+    r"\bK[A-Z0-9-]{8,}\b",     # 'K' + 8+ alfanuméricos/guiones
 ]
 
 def regex_pick_serial(text: str) -> str | None:
-    # Prioriza el primero que haga match.
     for pattern in SERIAL_REGEXES:
-        m = re.search(pattern, text)
+        m = re.search(pattern, text, flags=re.IGNORECASE)
         if m:
             return m.group(0).upper()
     return None
 
+def serial_after_label(text: str, label="Carrete") -> str | None:
+    """
+    Busca explícitamente la etiqueta y toma el token que sigue:
+    Carrete: <SERIAL>
+    """
+    # Línea con 'Carrete:' y captura token siguiente
+    m = re.search(rf"{label}\s*:\s*([A-Za-z0-9\-]{{8,}})", text, re.IGNORECASE)
+    if m:
+        candidate = m.group(1).upper()
+        # valida contra regex más estricto si aplica
+        strong = regex_pick_serial(candidate)
+        return strong or candidate
+    return None
 
-def serial_via_accessibility(window_title: str, hint_label: str = "carrete") -> str | None:
-    """Intenta leer el valor del control Edit llamado 'carrete' usando UIA."""
+def serial_via_accessibility(window_title: str) -> str | None:
+    """Lee el texto real del control Edit y extrae tras 'Carrete:'; fallback a regex."""
     if not PYWINAUTO_OK:
         return None
     try:
         app = Application(backend="uia").connect(title_re=rf".*{re.escape(window_title)}.*", timeout=5)
         dlg = app.window(title_re=rf".*{re.escape(window_title)}.*")
         dlg.set_focus()
-        # Busca Edits con nombre que contenga 'carrete'
         edits = dlg.descendants(control_type="Edit")
-        # Intento 1: por name_accessible
         for e in edits:
             try:
-                name = e.element_info.name or ""
-                if hint_label.lower() in name.lower():
-                    wrapper = EditWrapper(e.element_info)
-                    val = wrapper.get_value()
-                    if val:
-                        serial = regex_pick_serial(val) or val.strip()
-                        if serial:
-                            return serial.upper()
+                wrapper = EditWrapper(e.element_info)
+                txt = wrapper.get_value() or ""
+                if not txt.strip():
+                    continue
+                # 1) prioriza 'Carrete:'
+                s = serial_after_label(txt, "Carrete")
+                if s:
+                    return s
+                # 2) fallback: regex global
+                s = regex_pick_serial(txt)
+                if s:
+                    return s
             except Exception:
                 continue
-        # Intento 2: por label cercano (Label seguido de Edit)
-        # Busca textos estáticos para 'carrete' y toma el siguiente Edit
-        texts = dlg.descendants(control_type="Text")
-        targets = [t for t in texts if (t.element_info.name or "").strip().lower().__contains__(hint_label)]
-        if targets:
-            # toma cualquier Edit del diálogo y escoge el más cercano
-            # enfoque simple: primero Edit del contenedor
-            for e in edits:
-                try:
-                    wrapper = EditWrapper(e.element_info)
-                    val = wrapper.get_value()
-                    if val:
-                        serial = regex_pick_serial(val) or val.strip()
-                        if serial:
-                            return serial.upper()
-                except Exception:
-                    continue
-    except (ElementNotFoundError, TimeoutError, Exception):
+    except Exception:
         return None
     return None
 
-
-def serial_via_ocr(pil_img: Image.Image, tesseract_cmd: str | None) -> str | None:
-    """OCR general sobre la ventana completa. Opcionalmente usa una pre-segmentación con OpenCV."""
+def serial_via_ocr(pil_img: "Image.Image", tesseract_cmd: str | None) -> str | None:
+    """OCR anclado a la etiqueta 'Carrete' y con lista blanca; sin diccionarios para evitar 'PEDIDOS'."""
     if not OCR_OK:
         return None
     if tesseract_cmd:
         pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
 
-    # Convertir PIL -> OpenCV BGR
+    # Preprocesado: escala, gris, binarización Otsu
+    img = np.array(pil_img)
+    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    scale = 1.5
+    h, w = bgr.shape[:2]
+    bgr = cv2.resize(bgr, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_LINEAR)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+    _, thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Config OCR: psm 6, idiomas eng+spa, lista blanca y sin diccionarios
+    config = (
+        "--psm 6 -l eng+spa "
+        "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789- "
+        "-c load_system_dawg=0 -c load_freq_dawg=0"
+    )
+
+    # 1) data por tokens para localizar 'Carrete'
     try:
-        import numpy as np
-        cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        data = pytesseract.image_to_data(thr, config=config, output_type=pytesseract.Output.DICT)
+        texts = data["text"]
+        line_num = data["line_num"]
+        idxs = [i for i, w in enumerate(texts) if w and re.fullmatch(r"(?i)carrete[:]?", w)]
+        if idxs:
+            i0 = idxs[0]
+            ln = line_num[i0]
+            # tokens posteriores en la misma línea primero; si no, siguientes 10 tokens
+            same_line = [i for i in range(i0 + 1, len(texts)) if line_num[i] == ln]
+            candidates = same_line or list(range(i0 + 1, min(i0 + 12, len(texts))))
+            for i in candidates:
+                tok = (texts[i] or "").strip().upper()
+                if re.fullmatch(r"[A-Z0-9-]{9,}", tok):  # mínimo 9
+                    strong = regex_pick_serial(tok)
+                    if strong:
+                        return strong
+                    return tok
     except Exception:
-        cv_img = None
+        pass
 
-    candidate_text = ""
+    # 2) fallback: texto completo y extracción por etiqueta/regex
     try:
-        if cv_img is not None:
-            # Preprocesado: escala + gris + binarización suave
-            scale = 1.5
-            h, w = cv_img.shape[:2]
-            cv_img = cv2.resize(cv_img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_LINEAR)
-            gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-            gray = cv2.bilateralFilter(gray, 9, 75, 75)
-            _, thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            config = "--psm 6"
-            candidate_text = pytesseract.image_to_string(thr, config=config)
-        else:
-            candidate_text = pytesseract.image_to_string(pil_img, config="--psm 6")
+        raw = pytesseract.image_to_string(thr, config=config)
     except Exception:
-        return None
+        raw = pytesseract.image_to_string(pil_img, config=config)
 
-    if not candidate_text:
-        return None
-
-    # Si encontramos la palabra 'carrete', intenta tomar el token que sigue
-    lines = [l.strip() for l in candidate_text.splitlines() if l.strip()]
-    joined = " ".join(lines)
-    serial = None
-
-    # 1) busca patrón cercano a 'carrete'
-    m = re.search(r"(carrete|carreté|carrete:)\s*([A-Za-z0-9\-]{5,20})", joined, re.IGNORECASE)
-    if m:
-        serial = m.group(2).upper()
-
-    # 2) si no, usa regex general
-    if not serial:
-        serial = regex_pick_serial(joined)
-
-    return serial
-
+    s = serial_after_label(raw, "Carrete")
+    if s:
+        return s
+    return regex_pick_serial(raw)
 
 def decide_output_path(outdir: Path, serial: str) -> Path:
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", serial)
     return outdir.joinpath(f"{safe}.jpg")
 
-
+# ------------------ MAIN ------------------
 def main():
     ensure_windows()
 
-    parser = argparse.ArgumentParser(description="Captura un JPG de una ventana y nombra el archivo con el serial del 'carrete'.")
-    parser.add_argument("--title", type=str, default=None, help="Título exacto o parcial de la ventana. Si se omite, usa la activa.")
-    parser.add_argument("--outdir", type=str, required=True, help="Carpeta destino del JPG.")
-    parser.add_argument("--serial", type=str, default=None, help="Serial manual. Si se pasa, se omite extracción.")
-    parser.add_argument("--tess", type=str, default=None, help="Ruta a tesseract.exe si no está en PATH.")
+    # Se mantienen argumentos para sobrescribir, pero con defaults internos
+    parser = argparse.ArgumentParser(description="Captura ventana, extrae serial tras 'Carrete:' y guarda JPG con ese nombre.")
+    parser.add_argument("--title", type=str, default=DEFAULT_WINDOW_TITLE, help="Título de la ventana (por defecto: config interna).")
+    parser.add_argument("--outdir", type=str, default=DEFAULT_OUTPUT_DIR, help="Carpeta destino (por defecto: config interna).")
+    parser.add_argument("--serial", type=str, default=None, help="Forzar serial manual.")
+    parser.add_argument("--tess", type=str, default=DEFAULT_TESSERACT_PATH, help="Ruta a tesseract.exe si no está en PATH.")
     args = parser.parse_args()
 
     outdir = Path(args.outdir)
-    if not outdir.exists():
-        try:
-            outdir.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            print(f"Error creando carpeta destino: {e}")
-            sys.exit(5)
+    try:
+        outdir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"Error creando carpeta destino: {e}")
+        sys.exit(5)
 
-    # 1) localizar ventana
     win = find_window(args.title)
-    if win is None:
-        t = args.title or "(ventana activa)"
-        print(f"Error: no se encontró la ventana: {t}")
+    if not win:
+        print(f"Error: no se encontró la ventana '{args.title}'.")
         sys.exit(2)
 
     bring_to_front(win)
@@ -251,47 +243,31 @@ def main():
         print(f"Error: {e}")
         sys.exit(3)
 
-    # Pequeña espera para estabilidad de dibujo
-    time.sleep(0.2)
-
-    # 2) captura imagen de la ventana
+    time.sleep(0.25)  # estabilidad de dibujo
     pil_img = screenshot_region(region)
 
-    # 3) obtener serial
+    # Extracción de serial: 1) forzado 2) accesibilidad 3) OCR
     serial = args.serial
     if not serial:
-        # Intento 1: accesibilidad
-        serial = serial_via_accessibility(win.title, hint_label="carrete")
+        serial = serial_via_accessibility(win.title)
     if not serial:
-        # Intento 2: OCR
         serial = serial_via_ocr(pil_img, args.tess)
 
     if not serial:
-        print("Advertencia: no se pudo extraer el serial automáticamente.")
-        print("Sugerencias:")
-        print("- Verifica que el input se llame 'carrete' o esté visible.")
-        print("- Ejecuta con --serial para forzar el nombre.")
-        print("- Si usas OCR, instala Tesseract y pasa --tess con su ruta.")
-        # Aún así guardar con timestamp para no perder la captura
-        timestamp_name = time.strftime("captura_%Y%m%d_%H%M%S")
-        outfile = outdir.joinpath(f"{timestamp_name}.jpg")
-    else:
-        outfile = decide_output_path(outdir, serial)
+        print("Advertencia: no se pudo extraer el serial automáticamente. Se usará timestamp.")
+        serial = time.strftime("captura_%Y%m%d_%H%M%S")
 
-    # 4) guardar JPG
+    outfile = decide_output_path(outdir, serial)
+
     try:
         save_jpg(pil_img, outfile)
     except Exception as e:
         print(f"Error al guardar captura: {e}")
         sys.exit(4)
 
-    if serial:
-        print(f"Captura guardada: {outfile}")
-        print(f"Serial detectado: {serial}")
-    else:
-        print(f"Captura guardada sin serial: {outfile}")
+    print(f"Captura guardada en: {outfile}")
+    print(f"Serial: {serial}")
 
 if __name__ == "__main__":
-    # Nota DPI: si el recorte se desalineara por escalado, ajusta la escala de pantalla de Windows.
     pyautogui.FAILSAFE = True
     main()
